@@ -1,3 +1,8 @@
+## Binaries
 server
 
+## Log files
+*.log
+
+## IDE files
 .vscode
