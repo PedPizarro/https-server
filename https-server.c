@@ -8,12 +8,13 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <time.h>
 
 #define PORT 8080
 #define MAX_REQUEST_SIZE 65536 // 64KB max request
 #define MAX_HEADERS 100
-#define MAX_PATH 2048
-#define MAX_HEADER_LINE 8192
+#define MAX_PATH 2048        // 2KB max path length
+#define MAX_HEADER_LINE 8192 // 8KB max header line
 #define MAX_METHOD 16
 #define MAX_VERSION 16
 #define READ_TIMEOUT_SEC 30 // 30 second timeout
@@ -30,11 +31,44 @@ typedef struct
     size_t content_length;
 } http_request;
 
+typedef struct
+{
+    const char *ext;
+    const char *type;
+} mime_type;
+
+static const mime_type mime_types[] = {
+    {".html", "text/html"},
+    {".htm", "text/html"},
+    {".css", "text/css"},
+    {".js", "application/javascript"},
+    {".jpg", "image/jpeg"},
+    {".jpeg", "image/jpeg"},
+    {".png", "image/png"},
+    {".gif", "image/gif"},
+    {".txt", "text/plain"},
+    {NULL, "application/octet-stream"}};
+
+const char *get_mime_type(const char *filepath)
+{
+    const char *ext = strrchr(filepath, '.');
+    if (!ext)
+        return mime_types[sizeof(mime_types) / sizeof(mime_type) - 1].type;
+    for (size_t i = 0; mime_types[i].ext; i++)
+    {
+        if (strcasecmp(ext, mime_types[i].ext) == 0)
+        {
+            return mime_types[i].type;
+        }
+    }
+    return mime_types[sizeof(mime_types) / sizeof(mime_type) - 1].type;
+}
+
 // Set socket timeout
 int set_socket_timeout(int sockfd, int seconds)
 {
     struct timeval timeout;
-    timeout.tv_sec = 30;
+    timeout.tv_sec = seconds;
     timeout.tv_usec = 0;
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
@@ -346,34 +380,79 @@ int is_safe_path(const char *path)
     return 1;
 }
 
+int add_date_header(char *buf, size_t *offset, size_t max_len)
+{
+    time_t now;
+    struct tm *gm;
+    if (time(&now) == -1 || (gm = gmtime(&now)) == NULL)
+    {
+        fprintf(stderr, "Failed to get time for Date header\n");
+        if (*offset < max_len)
+        {
+            *offset += snprintf(buf + *offset, max_len - *offset, "Date: Error\r\n");
+            return -1;
+        }
+        return -1;
+    }
+    size_t len = strftime(buf + *offset, max_len - *offset, "Date: %a, %d %b %Y %H:%M:%S GMT\r\n", gm);
+    if (len == 0)
+    {
+        fprintf(stderr, "Date header buffer too small\n");
+        return -1;
+    }
+    *offset += len;
+    return 0;
+}
+
 // Send error response
 void send_error_response(int client_fd, int status_code, const char *status_text)
 {
-    char response[1024];
+    char headers[1024] = {0};
+    size_t offset = 0;
     char body[256];
 
     snprintf(body, sizeof(body),
              "<html><body><h1>%d %s</h1></body></html>",
              status_code, status_text);
 
-    int len = snprintf(response, sizeof(response),
-                       "HTTP/1.1 %d %s\r\n"
+    offset += snprintf(headers + offset, sizeof(headers) - offset,
+                       "HTTP/1.1 %d %s\r\n", status_code, status_text);
+    add_date_header(headers, &offset, sizeof(headers));
+    offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: text/html\r\n"
                        "Content-Length: %d\r\n"
                        "Connection: close\r\n"
-                       "\r\n"
-                       "%s",
-                       status_code, status_text, (int)strlen(body), body);
+                       "\r\n",
+                       (int)strlen(body));
 
-    if (len > 0 && len < sizeof(response))
+    if (offset >= sizeof(headers))
     {
-        send(client_fd, response, len, 0);
-        printf("Sent %d %s response\n", status_code, status_text);
+        fprintf(stderr, "Error: Headers buffer too small\n");
+        return;
     }
+
+    // Combine headers and body
+    size_t body_len = strlen(body);
+    if (offset + body_len < sizeof(headers))
+    {
+        memcpy(headers + offset, body, body_len);
+        offset += body_len;
+    }
+    else
+    {
+        fprintf(stderr, "Error: Headers+body buffer too small\n");
+        return;
+    }
+
+    if (send(client_fd, headers, offset, 0) < 0)
+    {
+        perror("send failed");
+    }
+    printf("Sent %d %s response\n", status_code, status_text);
 }
 
 // Send file response
-void send_file_response(int client_fd, const char *filepath)
+void send_file_response(int client_fd, const char *filepath, const char *method)
 {
     FILE *file = fopen(filepath, "rb");
     if (!file)
@@ -394,26 +473,47 @@ void send_file_response(int client_fd, const char *filepath)
         return;
     }
 
-    // Send headers
-    char headers[512];
-    int header_len = snprintf(headers, sizeof(headers),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: text/html\r\n"
-                              "Content-Length: %ld\r\n"
-                              "Connection: close\r\n"
-                              "\r\n",
-                              file_size);
+    // Build headers
+    char headers[1024] = {0};
+    size_t offset = 0;
+    offset += snprintf(headers + offset, sizeof(headers) - offset,
+                       "HTTP/1.1 200 OK\r\n");
+    add_date_header(headers, &offset, sizeof(headers));
+    offset += snprintf(headers + offset, sizeof(headers) - offset,
+                       "Content-Type: %s\r\n"
+                       "Content-Length: %ld\r\n"
+                       "Connection: close\r\n"
+                       "\r\n",
+                       get_mime_type(filepath), file_size);
 
-    send(client_fd, headers, header_len, 0);
-
-    // Send file content
-    char buffer[4096];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0)
+    if (offset >= sizeof(headers))
     {
-        if (send(client_fd, buffer, bytes_read, 0) < 0)
+        fclose(file);
+        fprintf(stderr, "Error: Headers buffer too small\n");
+        send_error_response(client_fd, 500, "Internal Server Error");
+        return;
+    }
+
+    // Send headers
+    if (send(client_fd, headers, offset, 0) < 0)
+    {
+        fclose(file);
+        perror("send failed");
+        return;
+    }
+
+    // Send file content only if method is GET
+    if (strcasecmp(method, "GET") == 0)
+    {
+        char buffer[4096];
+        size_t bytes_read;
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0)
         {
-            break;
+            if (send(client_fd, buffer, bytes_read, 0) < 0)
+            {
+                perror("send failed");
+                break;
+            }
         }
     }
 
@@ -432,6 +532,78 @@ void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
     {
         snprintf(file_path, max_len, "./www%s", url_path);
     }
+}
+
+void handle_post_request(int client_fd, const http_request *request)
+{
+    // Store body to file
+    if (request->body_length > 0)
+    {
+        FILE *log = fopen("post.log", "a");
+        if (log)
+        {
+            fwrite(request->body, 1, request->body_length, log);
+            fwrite("\n", 1, 1, log); // Separator
+            fclose(log);
+        }
+        else
+        {
+            fprintf(stderr, "Failed to open post.log for writing\n");
+        }
+    }
+
+    // Build response
+    char headers[1024] = {0};
+    size_t offset = 0;
+    char response_body[1024];
+    int body_len = 0;
+
+    if (request->body_length > 0)
+    {
+        body_len = snprintf(response_body, sizeof(response_body), "Received: %.*s",
+                            (int)request->body_length, request->body);
+    }
+    else
+    {
+        body_len = snprintf(response_body, sizeof(response_body), "Received empty POST request to %s",
+                            request->path);
+    }
+
+    offset += snprintf(headers + offset, sizeof(headers) - offset, "HTTP/1.1 200 OK\r\n");
+    add_date_header(headers, &offset, sizeof(headers));
+    offset += snprintf(headers + offset, sizeof(headers) - offset,
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %d\r\n"
+                       "Connection: close\r\n"
+                       "\r\n",
+                       body_len);
+
+    if (offset >= sizeof(headers))
+    {
+        fprintf(stderr, "Error: Headers buffer too small\n");
+        send_error_response(client_fd, 500, "Internal Server Error");
+        return;
+    }
+
+    // Combine headers and body
+    if (offset + body_len < sizeof(headers))
+    {
+        memcpy(headers + offset, response_body, body_len);
+        offset += body_len;
+    }
+    else
+    {
+        fprintf(stderr, "Error: Headers+body buffer too small\n");
+        send_error_response(client_fd, 500, "Internal Server Error");
+        return;
+    }
+
+    if (send(client_fd, headers, offset, 0) < 0)
+    {
+        perror("send failed");
+    }
+
+    printf("Handled POST request to %s with %zu bytes\n", request->path, request->body_length);
 }
 
 // Main request handler with proper HTTP parsing
@@ -532,21 +704,11 @@ void handle_client(int client_fd)
     {
         char file_path[1024];
         map_path_to_file(request.path, file_path, sizeof(file_path));
-        send_file_response(client_fd, file_path);
+        send_file_response(client_fd, file_path, request.method);
     }
     else if (strcmp(request.method, "POST") == 0)
     {
-        // For now, just echo that we received POST data
-        char response[4096];
-        snprintf(response, sizeof(response),
-                 "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: text/plain\r\n"
-                 "Connection: close\r\n"
-                 "\r\n"
-                 "Received POST request to %s with %zu bytes of data\n",
-                 request.path, request.body_length);
-        send(client_fd, response, strlen(response), 0);
-        printf("Handled POST request to %s\n", request.path);
+        handle_post_request(client_fd, &request);
     }
     else
     {
@@ -556,7 +718,7 @@ void handle_client(int client_fd)
     free(buffer);
 }
 
-// Main function (unchanged)
+// Main function
 int main()
 {
     int server_fd, client_fd;
