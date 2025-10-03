@@ -17,7 +17,9 @@
 #define MAX_HEADER_LINE 8192 // 8KB max header line
 #define MAX_METHOD 16
 #define MAX_VERSION 16
-#define READ_TIMEOUT_SEC 30 // 30 second timeout
+
+#define READ_TIMEOUT_SEC 30      // 30 second timeout
+#define KEEP_ALIVE_TIMEOUT_SEC 5 // 5 second keep-alive timeout
 
 typedef struct
 {
@@ -29,6 +31,7 @@ typedef struct
     char *body;
     size_t body_length;
     size_t content_length;
+    char connection_header[16];
 } http_request;
 
 typedef struct
@@ -325,6 +328,20 @@ int parse_headers(const char *request_data, http_request *req)
             return 0;
         }
 
+        // Check for Connection and "keep-alive" flag
+        if (strncasecmp(line_start, "Connection:", 11) == 0)
+        {
+            const char *value = line_start + 11;
+            while (*value == ' ' || *value == '\t')
+                value++;
+            size_t value_len = line_end - value;
+            if (value_len < sizeof(req->connection_header))
+            {
+                strncpy(req->connection_header, value, value_len);
+                req->connection_header[value_len] = '\0';
+            }
+        }
+
         // Copy header
         strncpy(req->headers[req->header_count], line_start, line_len);
         req->headers[req->header_count][line_len] = '\0';
@@ -405,7 +422,7 @@ int add_date_header(char *buf, size_t *offset, size_t max_len)
 }
 
 // Send error response
-void send_error_response(int client_fd, int status_code, const char *status_text)
+void send_error_response(int client_fd, int status_code, const char *status_text, const char *connection_header)
 {
     char headers[1024] = {0};
     size_t offset = 0;
@@ -421,9 +438,9 @@ void send_error_response(int client_fd, int status_code, const char *status_text
     offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: text/html\r\n"
                        "Content-Length: %d\r\n"
-                       "Connection: close\r\n"
+                       "Connection: %s\r\n"
                        "\r\n",
-                       (int)strlen(body));
+                       (int)strlen(body), connection_header);
 
     if (offset >= sizeof(headers))
     {
@@ -452,12 +469,12 @@ void send_error_response(int client_fd, int status_code, const char *status_text
 }
 
 // Send file response
-void send_file_response(int client_fd, const char *filepath, const char *method)
+void send_file_response(int client_fd, const char *filepath, const char *method, const char *connection_header)
 {
     FILE *file = fopen(filepath, "rb");
     if (!file)
     {
-        send_error_response(client_fd, 404, "Not Found");
+        send_error_response(client_fd, 404, "Not Found", connection_header);
         return;
     }
 
@@ -469,7 +486,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method)
     if (file_size < 0)
     {
         fclose(file);
-        send_error_response(client_fd, 500, "Internal Server Error");
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
         return;
     }
 
@@ -482,15 +499,15 @@ void send_file_response(int client_fd, const char *filepath, const char *method)
     offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: %s\r\n"
                        "Content-Length: %ld\r\n"
-                       "Connection: close\r\n"
+                       "Connection: %s\r\n"
                        "\r\n",
-                       get_mime_type(filepath), file_size);
+                       get_mime_type(filepath), file_size, connection_header);
 
     if (offset >= sizeof(headers))
     {
         fclose(file);
         fprintf(stderr, "Error: Headers buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error");
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
         return;
     }
 
@@ -534,7 +551,7 @@ void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
     }
 }
 
-void handle_post_request(int client_fd, const http_request *request)
+void handle_post_request(int client_fd, const http_request *request, const char *connection_header)
 {
     // Store body to file
     if (request->body_length > 0)
@@ -574,14 +591,14 @@ void handle_post_request(int client_fd, const http_request *request)
     offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: text/plain\r\n"
                        "Content-Length: %d\r\n"
-                       "Connection: close\r\n"
+                       "Connection: %s\r\n"
                        "\r\n",
-                       body_len);
+                       body_len, connection_header);
 
     if (offset >= sizeof(headers))
     {
         fprintf(stderr, "Error: Headers buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error");
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
         return;
     }
 
@@ -594,7 +611,7 @@ void handle_post_request(int client_fd, const http_request *request)
     else
     {
         fprintf(stderr, "Error: Headers+body buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error");
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
         return;
     }
 
@@ -621,13 +638,25 @@ void handle_client(int client_fd)
     // Set socket timeout
     set_socket_timeout(client_fd, READ_TIMEOUT_SEC);
 
+    do
+    {
+        http_request request = {0};
+        strcpy(request.connection_header, "close"); // Default to close
+
     // Step 1: Read complete headers
     int total_read = read_http_headers(client_fd, buffer, MAX_REQUEST_SIZE);
     if (total_read <= 0)
     {
-        send_error_response(client_fd, 400, "Bad Request");
-        free(buffer);
-        return;
+            if (total_read == 0)
+            {
+                printf("Client closed connection\n");
+            }
+            else
+            {
+                printf("Timeout or error reading headers\n");
+            }
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
+            break;
     }
 
     // Step 2: Find where headers end
@@ -639,7 +668,7 @@ void handle_client(int client_fd)
     *first_line_end = '\0'; // Temporarily null-terminate first line
     if (!parse_request_line(buffer, &request))
     {
-        send_error_response(client_fd, 400, "Bad Request");
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
         free(buffer);
         return;
     }
@@ -650,7 +679,7 @@ void handle_client(int client_fd)
     // Step 4: Validate HTTP version
     if (strcmp(request.version, "HTTP/1.1") != 0 && strcmp(request.version, "HTTP/1.0") != 0)
     {
-        send_error_response(client_fd, 505, "HTTP Version Not Supported");
+            send_error_response(client_fd, 505, "HTTP Version Not Supported", request.connection_header);
         free(buffer);
         return;
     }
@@ -658,7 +687,7 @@ void handle_client(int client_fd)
     // Step 5: Parse headers
     if (!parse_headers(buffer, &request))
     {
-        send_error_response(client_fd, 400, "Bad Request");
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
         free(buffer);
         return;
     }
@@ -666,7 +695,7 @@ void handle_client(int client_fd)
     // Step 6: Validate request
     if (!validate_http_request(&request))
     {
-        send_error_response(client_fd, 400, "Bad Request");
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
         free(buffer);
         return;
     }
@@ -674,7 +703,7 @@ void handle_client(int client_fd)
     // Step 7: Read body if present (for POST/PUT requests)
     if (read_http_body(client_fd, buffer, header_end - buffer, total_read, &request) < 0)
     {
-        send_error_response(client_fd, 400, "Bad Request");
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
         free(buffer);
         return;
     }
@@ -694,7 +723,7 @@ void handle_client(int client_fd)
     // Step 8: Validate path safety
     if (!is_safe_path(request.path))
     {
-        send_error_response(client_fd, 400, "Bad Request");
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
         free(buffer);
         return;
     }
@@ -704,16 +733,24 @@ void handle_client(int client_fd)
     {
         char file_path[1024];
         map_path_to_file(request.path, file_path, sizeof(file_path));
-        send_file_response(client_fd, file_path, request.method);
+            send_file_response(client_fd, file_path, request.method, request.connection_header);
     }
     else if (strcmp(request.method, "POST") == 0)
     {
-        handle_post_request(client_fd, &request);
+            handle_post_request(client_fd, &request, request.connection_header);
     }
     else
     {
-        send_error_response(client_fd, 405, "Method Not Allowed");
+            send_error_response(client_fd, 405, "Method Not Allowed", request.connection_header);
     }
+
+        if (strcmp(request.connection_header, "keep-alive") != 0)
+        {
+            break;
+        }
+
+        set_socket_timeout(client_fd, KEEP_ALIVE_TIMEOUT_SEC);
+    } while (1);
 
     free(buffer);
 }
