@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ctype.h>
 
 #define PORT 8080
 #define MAX_REQUEST_SIZE 65536 // 64KB max request
@@ -554,19 +555,104 @@ void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
 void handle_post_request(int client_fd, const http_request *request, const char *connection_header)
 {
     // Store body to file
-    if (request->body_length > 0)
+    if (request->body_length > 0 && strcmp(request->path, "/test") == 0)
     {
-        FILE *log = fopen("post.log", "a");
-        if (log)
+        char dir_path[1024];
+        map_path_to_file(request->path, dir_path, sizeof(dir_path));
+        size_t dir_path_len = strlen(dir_path);
+
+        struct stat st;
+        if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode))
         {
-            fwrite(request->body, 1, request->body_length, log);
-            fwrite("\n", 1, 1, log); // Separator
-            fclose(log);
+            fprintf(stderr, "Directory %s does not exist or is not a directory\n", dir_path);
+            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+            return;
+        }
+
+        // Check Content-Type
+        const char *content_type = NULL;
+        for (int i = 0; i < request->header_count; i++)
+        {
+            if (strncasecmp(request->headers[i], "Content-Type:", 13) == 0)
+            {
+                content_type = request->headers[i] + 13;
+                while (*content_type == ' ' || *content_type == '\t')
+                    content_type++;
+                break;
+            }
+        }
+
+        char log_path[1024];
+        FILE *log = NULL;
+
+        if (content_type && strncasecmp(content_type, "image/", 6) == 0) // Handle image (binary) data
+        {
+            const char *subtype = content_type + 6;
+            char extension[64] = "bin"; // Fallback extension
+
+            // Extract subtype up to ';' (if optional parameters present) or end, and convert to lowercase
+            size_t ext_len = 0;
+            for (const char *p = subtype; *p && *p != ';' && ext_len < sizeof(extension) - 1; p++, ext_len++)
+            {
+                extension[ext_len] = tolower(*p);
+            }
+            extension[ext_len] = '\0';
+
+            // Validate: only alphanumeric characters allowed
+            for (size_t i = 0; extension[i]; i++)
+            {
+                if (!isalnum(extension[i]))
+                {
+                    strcpy(extension, "bin"); // Fallback for invalid subtypes
+                    break;
+                }
+            }
+
+            if (dir_path_len > sizeof(log_path) - strlen("/image.") - ext_len - 1)
+            {
+                fprintf(stderr, "Directory path too long for image log: %s\n", dir_path);
+                send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+                return;
+            }
+            snprintf(log_path, sizeof(log_path), "%s/image.%s", dir_path, extension);
+
+            // Open in binary mode
+            log = fopen(log_path, "wb");
+        }
+        else if (content_type && // Handle text data
+                 (strncasecmp(content_type, "text/", 5) == 0 ||
+                  strncasecmp(content_type, "application/json", 16) == 0 ||
+                  strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
+        {
+            snprintf(log_path, sizeof(log_path), "%s/post.log", dir_path);
+
+            // Open in text mode, append
+            log = fopen(log_path, "a");
         }
         else
         {
-            fprintf(stderr, "Failed to open post.log for writing\n");
+            fprintf(stderr, "Unsupported Content-Type: %s\n", content_type ? content_type : "none");
+            send_error_response(client_fd, 415, "Unsupported Media Type", request->connection_header);
+            return;
         }
+
+        if (!log)
+        {
+            fprintf(stderr, "Failed to open %s for writing: %s\n", log_path, strerror(errno));
+            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+            return;
+        }
+
+        fwrite(request->body, 1, request->body_length, log);
+
+        // Append newline for text files only
+        if (content_type && (strncasecmp(content_type, "text/", 5) == 0 ||
+                             strncasecmp(content_type, "application/json", 16) == 0 ||
+                             strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
+        {
+            fwrite("\n", 1, 1, log);
+        }
+        fclose(log);
     }
 
     // Build response
@@ -633,8 +719,6 @@ void handle_client(int client_fd)
         return;
     }
 
-    http_request request = {0};
-
     // Set socket timeout
     set_socket_timeout(client_fd, READ_TIMEOUT_SEC);
 
@@ -643,10 +727,10 @@ void handle_client(int client_fd)
         http_request request = {0};
         strcpy(request.connection_header, "close"); // Default to close
 
-    // Step 1: Read complete headers
-    int total_read = read_http_headers(client_fd, buffer, MAX_REQUEST_SIZE);
-    if (total_read <= 0)
-    {
+        // Step 1: Read complete headers
+        int total_read = read_http_headers(client_fd, buffer, MAX_REQUEST_SIZE);
+        if (total_read <= 0)
+        {
             if (total_read == 0)
             {
                 printf("Client closed connection\n");
@@ -657,92 +741,92 @@ void handle_client(int client_fd)
             }
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
             break;
-    }
+        }
 
-    // Step 2: Find where headers end
-    char *header_end = strstr(buffer, "\r\n\r\n");
+        // Step 2: Find where headers end
+        char *header_end = strstr(buffer, "\r\n\r\n");
 
-    // Step 3: Parse request line
-    char *first_line_end = strstr(buffer, "\r\n");
+        // Step 3: Parse request line
+        char *first_line_end = strstr(buffer, "\r\n");
 
-    *first_line_end = '\0'; // Temporarily null-terminate first line
-    if (!parse_request_line(buffer, &request))
-    {
+        *first_line_end = '\0'; // Temporarily null-terminate first line
+        if (!parse_request_line(buffer, &request))
+        {
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-        free(buffer);
-        return;
-    }
-    *first_line_end = '\r'; // Restore buffer
+            free(buffer);
+            return;
+        }
+        *first_line_end = '\r'; // Restore buffer
 
-    printf("Request: %s %s %s\n", request.method, request.path, request.version);
+        printf("Request: %s %s %s\n", request.method, request.path, request.version);
 
-    // Step 4: Validate HTTP version
-    if (strcmp(request.version, "HTTP/1.1") != 0 && strcmp(request.version, "HTTP/1.0") != 0)
-    {
+        // Step 4: Validate HTTP version
+        if (strcmp(request.version, "HTTP/1.1") != 0 && strcmp(request.version, "HTTP/1.0") != 0)
+        {
             send_error_response(client_fd, 505, "HTTP Version Not Supported", request.connection_header);
-        free(buffer);
-        return;
-    }
+            free(buffer);
+            return;
+        }
 
-    // Step 5: Parse headers
-    if (!parse_headers(buffer, &request))
-    {
+        // Step 5: Parse headers
+        if (!parse_headers(buffer, &request))
+        {
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-        free(buffer);
-        return;
-    }
+            free(buffer);
+            return;
+        }
 
-    // Step 6: Validate request
-    if (!validate_http_request(&request))
-    {
+        // Step 6: Validate request
+        if (!validate_http_request(&request))
+        {
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-        free(buffer);
-        return;
-    }
+            free(buffer);
+            return;
+        }
 
-    // Step 7: Read body if present (for POST/PUT requests)
-    if (read_http_body(client_fd, buffer, header_end - buffer, total_read, &request) < 0)
-    {
+        // Step 7: Read body if present (for POST/PUT requests)
+        if (read_http_body(client_fd, buffer, header_end - buffer, total_read, &request) < 0)
+        {
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-        free(buffer);
-        return;
-    }
+            free(buffer);
+            return;
+        }
 
-    if (request.body_length > 0)
-    {
-        printf("Request body: %zu bytes\n", request.body_length);
-        // For debugging, print first 100 chars of body
-        char preview[101];
-        size_t preview_len = (request.body_length < 100) ? request.body_length : 100;
-        strncpy(preview, request.body, preview_len);
-        preview[preview_len] = '\0';
-        printf("Body preview: %.100s%s\n", preview,
-               (request.body_length > 100) ? "..." : "");
-    }
+        if (request.body_length > 0)
+        {
+            printf("Request body: %zu bytes\n", request.body_length);
+            // For debugging, print first 100 chars of body
+            char preview[101];
+            size_t preview_len = (request.body_length < 100) ? request.body_length : 100;
+            strncpy(preview, request.body, preview_len);
+            preview[preview_len] = '\0';
+            printf("Body preview: %.100s%s\n", preview,
+                   (request.body_length > 100) ? "..." : "");
+        }
 
-    // Step 8: Validate path safety
-    if (!is_safe_path(request.path))
-    {
+        // Step 8: Validate path safety
+        if (!is_safe_path(request.path))
+        {
             send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-        free(buffer);
-        return;
-    }
+            free(buffer);
+            return;
+        }
 
-    // Step 9: Handle different methods
-    if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
-    {
-        char file_path[1024];
-        map_path_to_file(request.path, file_path, sizeof(file_path));
+        // Step 9: Handle different methods
+        if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
+        {
+            char file_path[1024];
+            map_path_to_file(request.path, file_path, sizeof(file_path));
             send_file_response(client_fd, file_path, request.method, request.connection_header);
-    }
-    else if (strcmp(request.method, "POST") == 0)
-    {
+        }
+        else if (strcmp(request.method, "POST") == 0)
+        {
             handle_post_request(client_fd, &request, request.connection_header);
-    }
-    else
-    {
+        }
+        else
+        {
             send_error_response(client_fd, 405, "Method Not Allowed", request.connection_header);
-    }
+        }
 
         if (strcmp(request.connection_header, "keep-alive") != 0)
         {
