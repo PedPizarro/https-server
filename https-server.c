@@ -60,7 +60,7 @@ const char *get_mime_type(const char *filepath)
         return mime_types[sizeof(mime_types) / sizeof(mime_type) - 1].type;
     for (size_t i = 0; mime_types[i].ext; i++)
     {
-        if (strcasecmp(ext, mime_types[i].ext) == 0)
+        if (str_case_cmp(ext, mime_types[i].ext) == 0)
         {
             return mime_types[i].type;
         }
@@ -164,7 +164,7 @@ size_t get_content_length(const http_request *req)
 {
     for (int i = 0; i < req->header_count; i++)
     {
-        if (strncasecmp(req->headers[i], "Content-Length:", 15) == 0)
+        if (strn_case_cmp(req->headers[i], "Content-Length:", 15) == 0)
         {
             const char *value = req->headers[i] + 15;
             // Skip whitespace
@@ -364,7 +364,7 @@ int validate_http_request(const http_request *req)
         int has_host = 0;
         for (int i = 0; i < req->header_count; i++)
         {
-            if (strncasecmp(req->headers[i], "Host:", 5) == 0)
+            if (strn_case_cmp(req->headers[i], "Host:", 5) == 0)
             {
                 has_host = 1;
                 break;
@@ -521,7 +521,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
     }
 
     // Send file content only if method is GET
-    if (strcasecmp(method, "GET") == 0)
+    if (str_case_cmp(method, "GET") == 0)
     {
         char buffer[4096];
         size_t bytes_read;
@@ -573,7 +573,7 @@ void handle_post_request(int client_fd, const http_request *request, const char 
         const char *content_type = NULL;
         for (int i = 0; i < request->header_count; i++)
         {
-            if (strncasecmp(request->headers[i], "Content-Type:", 13) == 0)
+            if (strn_case_cmp(request->headers[i], "Content-Type:", 13) == 0)
             {
                 content_type = request->headers[i] + 13;
                 while (*content_type == ' ' || *content_type == '\t')
@@ -585,7 +585,7 @@ void handle_post_request(int client_fd, const http_request *request, const char 
         char log_path[1024];
         FILE *log = NULL;
 
-        if (content_type && strncasecmp(content_type, "image/", 6) == 0) // Handle image (binary) data
+        if (content_type && strn_case_cmp(content_type, "image/", 6) == 0) // Handle image (binary) data
         {
             const char *subtype = content_type + 6;
             char extension[64] = "bin"; // Fallback extension
@@ -620,9 +620,9 @@ void handle_post_request(int client_fd, const http_request *request, const char 
             log = fopen(log_path, "wb");
         }
         else if (content_type && // Handle text data
-                 (strncasecmp(content_type, "text/", 5) == 0 ||
-                  strncasecmp(content_type, "application/json", 16) == 0 ||
-                  strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
+                 (strn_case_cmp(content_type, "text/", 5) == 0 ||
+                  strn_case_cmp(content_type, "application/json", 16) == 0 ||
+                  strn_case_cmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
         {
             snprintf(log_path, sizeof(log_path), "%s/post.log", dir_path);
 
@@ -646,9 +646,9 @@ void handle_post_request(int client_fd, const http_request *request, const char 
         fwrite(request->body, 1, request->body_length, log);
 
         // Append newline for text files only
-        if (content_type && (strncasecmp(content_type, "text/", 5) == 0 ||
-                             strncasecmp(content_type, "application/json", 16) == 0 ||
-                             strncasecmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
+        if (content_type && (strn_case_cmp(content_type, "text/", 5) == 0 ||
+                             strn_case_cmp(content_type, "application/json", 16) == 0 ||
+                             strn_case_cmp(content_type, "application/x-www-form-urlencoded", 33) == 0))
         {
             fwrite("\n", 1, 1, log);
         }
@@ -827,8 +827,8 @@ void handle_client(int client_fd)
         {
             send_error_response(client_fd, 405, "Method Not Allowed", request.connection_header);
         }
-
-        if (strcmp(request.connection_header, "keep-alive") != 0)
+        printf("connection header: %s\n", request.connection_header);
+        if (strn_case_cmp(request.connection_header, "keep-alive", 10) != 0)
         {
             break;
         }
