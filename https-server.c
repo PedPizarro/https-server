@@ -36,7 +36,7 @@ typedef struct
     char *body;
     size_t body_length;
     size_t content_length;
-    char connection_header[16];
+    char connection_header[32];
 } http_request;
 
 typedef struct
@@ -375,20 +375,13 @@ int parse_headers(const char *request_data, http_request *req)
         // Check for Connection header
         if (strn_case_cmp(req->headers[req->header_count], "Connection:", 11) == 0)
         {
-            const char *value = line_start + 11;
-            while (*value == ' ' || *value == '\t')
-                value++;
-            size_t value_len = line_end - value;
+            const char *value = req->headers[req->header_count] + 11;
+            size_t value_len = strlen(value);
+
             if (value_len < sizeof(req->connection_header))
-            {
-                strncpy(req->connection_header, value, value_len);
-                req->connection_header[value_len] = '\0';
-            }
+                strcpy(req->connection_header, value);
         }
 
-        // Copy header
-        strncpy(req->headers[req->header_count], line_start, line_len);
-        req->headers[req->header_count][line_len] = '\0';
         req->header_count++;
 
         line_start = line_end + 2;
