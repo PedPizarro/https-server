@@ -15,6 +15,7 @@
 #define MAX_REQUEST_SIZE 65536 // 64KB max request
 #define MAX_HEADERS 100
 #define MAX_PATH 2048        // 2KB max path length
+#define MAX_QUERY 1024       // 1KB max query length
 #define MAX_HEADER_LINE 8192 // 8KB max header line
 #define MAX_METHOD 16
 #define MAX_VERSION 16
@@ -26,6 +27,7 @@ typedef struct
 {
     char method[MAX_METHOD];
     char path[MAX_PATH];
+    char query[MAX_QUERY];
     char version[MAX_VERSION];
     char headers[MAX_HEADERS][MAX_HEADER_LINE];
     int header_count;
@@ -251,7 +253,7 @@ int read_http_body(int client_fd, char *buffer, size_t headers_end_pos,
 int parse_request_line(const char *line, http_request *req)
 {
     char method[MAX_METHOD];
-    char path[MAX_PATH];
+    char full_path[MAX_PATH];
     char version[MAX_VERSION];
 
     // Parse with size limits
@@ -260,6 +262,31 @@ int parse_request_line(const char *line, http_request *req)
     {
         printf("Failed to parse request line: '%s'\n", line);
         return 0;
+    }
+
+    size_t path_len = strlen(full_path);
+
+    // Split path and query
+    char *query_start = strchr(full_path, '?');
+    if (query_start)
+    {
+        path_len = query_start - full_path;
+        if (path_len >= MAX_PATH || strlen(query_start + 1) >= MAX_QUERY)
+        {
+            printf("Path or query too long\n");
+            return 0;
+        }
+        req->path[path_len] = '\0';
+        strcpy(req->query, query_start + 1);
+    }
+    else
+    {
+        if (path_len >= MAX_PATH)
+        {
+            printf("Path too long\n");
+            return 0;
+        }
+        req->query[0] = '\0';
     }
 
     // Validate lengths
@@ -291,6 +318,8 @@ int parse_request_line(const char *line, http_request *req)
     strcpy(req->method, method);
     strcpy(req->path, path);
     strcpy(req->version, version);
+    strncpy(req->path, full_path, path_len);
+    req->path[path_len] = '\0';
 
     return 1;
 }
