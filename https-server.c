@@ -590,6 +590,11 @@ void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
     }
     else
     {
+        if (strlen("./www") + strlen(url_path) >= max_len)
+        {
+            fprintf(stderr, "File path too long\n");
+            return;
+        }
         snprintf(file_path, max_len, "./www%s", url_path);
     }
 }
