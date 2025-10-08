@@ -10,6 +10,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <ctype.h>
+#include "http_mappings.h"
+#include "string_utils.h"
 
 #define PORT 8080
 #define MAX_REQUEST_SIZE 65536 // 64KB max request
@@ -257,8 +259,7 @@ int parse_request_line(const char *line, http_request *req)
     char version[MAX_VERSION];
 
     // Parse with size limits
-    int parsed = sscanf(line, "%15s %2047s %15s", method, path, version);
-    if (parsed != 3)
+    if (sscanf(line, "%15s %2047s %15s", method, full_path, version) != 3)
     {
         printf("Failed to parse request line: '%s'\n", line);
         return 0;
@@ -291,10 +292,16 @@ int parse_request_line(const char *line, http_request *req)
 
     // Validate lengths
     if (strlen(method) >= MAX_METHOD ||
-        strlen(path) >= MAX_PATH ||
         strlen(version) >= MAX_VERSION)
     {
         printf("Request line components too long\n");
+        return 0;
+    }
+
+    // Accept only known methods
+    if (!is_method_allowed(method))
+    {
+        printf("Unsupported method: %s\n", method);
         return 0;
     }
 
@@ -316,7 +323,6 @@ int parse_request_line(const char *line, http_request *req)
     }
 
     strcpy(req->method, method);
-    strcpy(req->path, path);
     strcpy(req->version, version);
     strncpy(req->path, full_path, path_len);
     req->path[path_len] = '\0';
@@ -358,8 +364,16 @@ int parse_headers(const char *request_data, http_request *req)
             return 0;
         }
 
-        // Check for Connection and "keep-alive" flag
-        if (strncasecmp(line_start, "Connection:", 11) == 0)
+        // Copy header
+        strncpy(req->headers[req->header_count], line_start, line_len);
+        req->headers[req->header_count][line_len] = '\0';
+
+        // Normalize header name and value to lowercase
+        normalize_header_name(req->headers[req->header_count]);
+        normalize_header_value(req->headers[req->header_count]);
+
+        // Check for Connection header
+        if (strn_case_cmp(req->headers[req->header_count], "Connection:", 11) == 0)
         {
             const char *value = line_start + 11;
             while (*value == ' ' || *value == '\t')
