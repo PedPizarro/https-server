@@ -779,14 +779,9 @@ void handle_client(int client_fd)
         if (total_read <= 0)
         {
             if (total_read == 0)
-            {
                 printf("Client closed connection\n");
-            }
             else
-            {
                 printf("Timeout or error reading headers\n");
-            }
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
             break;
         }
 
