@@ -5,7 +5,7 @@ LDFLAGS = -lpthread  # Remove if not using threads
 
 # Target binary and source files
 TARGET = server
-SRC = https-server.c
+SRC = $(wildcard *.c)
 
 # Default build target: remove old binary and compile
 all:
