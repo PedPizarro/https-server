@@ -384,10 +384,16 @@ int parse_headers(const char *request_data, http_request *req)
 
         req->header_count++;
 
+        // Jump over \r\n to go to next line
         line_start = line_end + 2;
     }
 
     printf("Parsed %d headers\n", req->header_count);
+    for (int i = 0; i < req->header_count; i++)
+    {
+        printf("Header[%d]: %s\n", i, req->headers[i]);
+    }
+
     return 1;
 }
 
