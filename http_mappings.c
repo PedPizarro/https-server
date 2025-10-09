@@ -6,8 +6,8 @@
 #include <stdio.h>
 
 // Define allowed methods and header mappings
-static const char *const allowed_methods[] = {"GET", "POST", "HEAD"};
-static const size_t allowed_methods_count =
+const char *const allowed_methods[] = {"GET", "POST", "HEAD"};
+const size_t allowed_methods_count =
     sizeof(allowed_methods) / sizeof(allowed_methods[0]);
 
 static const header_mapping_t header_mappings[] = {
@@ -254,7 +254,7 @@ int is_header_value_case_insensitive(const char *header_name)
 {
     for (size_t i = 0; i < header_mappings_count; i++)
     {
-        if (str_case_cmp(header_name, header_mappings[i].name))
+        if (str_case_cmp(header_name, header_mappings[i].name) == 0)
             return header_mappings[i].value_case_insensitive;
     }
     return 0;
@@ -264,7 +264,7 @@ int should_trim_ows(const char *header_name)
 {
     for (size_t i = 0; i < header_mappings_count; i++)
     {
-        if (str_case_cmp(header_name, header_mappings[i].name))
+        if (str_case_cmp(header_name, header_mappings[i].name) == 0)
             return header_mappings[i].trim_ows;
     }
     return 0;
