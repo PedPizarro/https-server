@@ -138,11 +138,11 @@ int read_http_headers(int client_fd, char *buffer, size_t buffer_size)
         {
             return HTTP_IO_ERROR;
         }
-            if (bytes == 0)
-            {
+        if (bytes == 0)
+        {
             // Client close: idle vs partial
             return (total_read == 0) ? HTTP_IO_EOF : HTTP_IO_EOF_PARTIAL;
-            }
+        }
         if (bytes < 0)
         {
             // Propagate other negative enums (future-proofing, shouldn't happen here)
@@ -342,11 +342,18 @@ int parse_request_line(const char *line, http_request *req)
         }
     }
 
-    // Validate version format
-    if (strncmp(version, "HTTP/", 5) != 0)
+    // Set default connection header based on http version
+    if (strncmp(version, "HTTP/1.0", 8) == 0)
     {
-        printf("Invalid HTTP version: %s\n", version);
-        return 0;
+        strcpy(req->connection_header, "close");
+    }
+    else if (strncmp(version, "HTTP/1.1", 8) == 0)
+    {
+        strcpy(req->connection_header, "keep-alive");
+    }
+    else
+    {
+        return HTTP_VERSION_UNSUPPORTED;
     }
 
     strcpy(req->method, method);
@@ -425,7 +432,7 @@ int parse_headers(const char *request_data, http_request *req)
 }
 
 // Check for required headers
-int validate_http_request(const http_request *req)
+int validate_http_request(http_request *req)
 {
     // HTTP/1.1 requires Host header
     if (strcmp(req->version, "HTTP/1.1") == 0)
@@ -442,7 +449,30 @@ int validate_http_request(const http_request *req)
         if (!has_host)
         {
             printf("HTTP/1.1 request missing Host header\n");
-            return 0;
+            return HTTP_PARSE_ERROR;
+        }
+    }
+
+    // Post requests must have Content-Length (CL) or Transfer-Encoding (TE) (for now, treat TE as not implemented)
+    int has_TE = 0, has_CL = 0;
+    for (int i = 0; i < req->header_count; i++)
+    {
+        if (strn_case_cmp(req->headers[i], "Transfer-Encoding:", 18) == 0)
+            has_TE = 1;
+        if (strn_case_cmp(req->headers[i], "Content-Length:", 15) == 0)
+            has_CL = 1;
+    }
+    if (has_TE)
+    {
+        printf("Transfer-Encoding present but not implemented\n");
+        return HTTP_NOT_IMPLEMENTED; // 501
+    }
+
+    if (strcmp(req->method, "POST") == 0)
+    {
+        if (!has_CL)
+        {
+            return HTTP_LENGTH_REQUIRED; // 411
         }
     }
 
@@ -465,77 +495,6 @@ int is_safe_path(const char *path)
     }
 
     return 1;
-}
-
-int add_date_header(char *buf, size_t *offset, size_t max_len)
-{
-    time_t now;
-    struct tm *gm;
-    if (time(&now) == -1 || (gm = gmtime(&now)) == NULL)
-    {
-        fprintf(stderr, "Failed to get time for Date header\n");
-        if (*offset < max_len)
-        {
-            *offset += snprintf(buf + *offset, max_len - *offset, "Date: Error\r\n");
-            return -1;
-        }
-        return -1;
-    }
-    size_t len = strftime(buf + *offset, max_len - *offset, "Date: %a, %d %b %Y %H:%M:%S GMT\r\n", gm);
-    if (len == 0)
-    {
-        fprintf(stderr, "Date header buffer too small\n");
-        return -1;
-    }
-    *offset += len;
-    return 0;
-}
-
-// Send error response
-void send_error_response(int client_fd, int status_code, const char *status_text, const char *connection_header)
-{
-    char headers[1024] = {0};
-    size_t offset = 0;
-    char body[256];
-
-    snprintf(body, sizeof(body),
-             "<html><body><h1>%d %s</h1></body></html>",
-             status_code, status_text);
-
-    offset += snprintf(headers + offset, sizeof(headers) - offset,
-                       "HTTP/1.1 %d %s\r\n", status_code, status_text);
-    add_date_header(headers, &offset, sizeof(headers));
-    offset += snprintf(headers + offset, sizeof(headers) - offset,
-                       "Content-Type: text/html\r\n"
-                       "Content-Length: %d\r\n"
-                       "Connection: %s\r\n"
-                       "\r\n",
-                       (int)strlen(body), connection_header);
-
-    if (offset >= sizeof(headers))
-    {
-        fprintf(stderr, "Error: Headers buffer too small\n");
-        return;
-    }
-
-    // Combine headers and body
-    size_t body_len = strlen(body);
-    if (offset + body_len < sizeof(headers))
-    {
-        memcpy(headers + offset, body, body_len);
-        offset += body_len;
-    }
-    else
-    {
-        fprintf(stderr, "Error: Headers+body buffer too small\n");
-        return;
-    }
-
-    if (send(client_fd, headers, offset, 0) < 0)
-    {
-        perror("send failed");
-    }
-    printf("Sent %d %s response\n", status_code, status_text);
 }
 
 // Send file response
@@ -569,9 +528,15 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
     offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: %s\r\n"
                        "Content-Length: %ld\r\n"
-                       "Connection: %s\r\n"
-                       "\r\n",
+                       "Connection: %s\r\n",
                        get_mime_type(filepath), file_size, connection_header);
+
+    if (strn_case_cmp(connection_header, "keep-alive", 10) == 0)
+    {
+        offset += snprintf(headers + offset, sizeof(headers) - offset,
+                           "Keep-Alive: timeout=%d\r\n", KEEP_ALIVE_TIMEOUT_SEC);
+    }
+    offset += snprintf(headers + offset, sizeof(headers) - offset, "\r\n");
 
     if (offset >= sizeof(headers))
     {
@@ -756,9 +721,14 @@ void handle_post_request(int client_fd, const http_request *request, const char 
     offset += snprintf(headers + offset, sizeof(headers) - offset,
                        "Content-Type: text/plain\r\n"
                        "Content-Length: %d\r\n"
-                       "Connection: %s\r\n"
-                       "\r\n",
+                       "Connection: %s\r\n",
                        body_len, connection_header);
+    if (strn_case_cmp(connection_header, "keep-alive", 10) == 0)
+    {
+        offset += snprintf(headers + offset, sizeof(headers) - offset,
+                           "Keep-Alive: timeout=%d\r\n", KEEP_ALIVE_TIMEOUT_SEC);
+    }
+    offset += snprintf(headers + offset, sizeof(headers) - offset, "\r\n");
 
     if (offset >= sizeof(headers))
     {
