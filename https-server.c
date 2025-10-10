@@ -10,8 +10,13 @@
 #include <sys/time.h>
 #include <time.h>
 #include <ctype.h>
+
+// Project headers
 #include "http_mappings.h"
 #include "string_utils.h"
+#include "http_errors.h"
+#include "error_handlers.h"
+#include "response_utils.h"
 
 #define PORT 8080
 #define MAX_REQUEST_SIZE 65536 // 64KB max request
@@ -96,10 +101,12 @@ ssize_t read_with_timeout(int sockfd, char *buffer, size_t size)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
             printf("Socket timeout occurred\n");
+            return HTTP_IO_TIMEOUT;
         }
         else
         {
             perror("recv() failed");
+            return HTTP_IO_ERROR;
         }
     }
 
@@ -122,13 +129,24 @@ int read_http_headers(int client_fd, char *buffer, size_t buffer_size)
                                           buffer + total_read,
                                           buffer_size - total_read - 1);
 
-        if (bytes <= 0)
+        if (bytes == HTTP_IO_TIMEOUT)
         {
+            // Timeout: idle vs partial
+            return (total_read == 0) ? HTTP_IO_TIMEOUT : HTTP_IO_TIMEOUT_PARTIAL;
+        }
+        if (bytes == HTTP_IO_ERROR)
+        {
+            return HTTP_IO_ERROR;
+        }
             if (bytes == 0)
             {
-                printf("Client closed connection while reading headers\n");
+            // Client close: idle vs partial
+            return (total_read == 0) ? HTTP_IO_EOF : HTTP_IO_EOF_PARTIAL;
             }
-            return -1;
+        if (bytes < 0)
+        {
+            // Propagate other negative enums (future-proofing, shouldn't happen here)
+            return (int)bytes;
         }
 
         total_read += bytes;
@@ -150,14 +168,14 @@ int read_http_headers(int client_fd, char *buffer, size_t buffer_size)
         if (total_read > MAX_REQUEST_SIZE / 2)
         {
             printf("Headers too large (%zu bytes)\n", total_read);
-            return -1;
+            return HTTP_HEADERS_TOO_LARGE;
         }
     }
 
     if (!header_end)
     {
-        printf("Headers incomplete or too large\n");
-        return -1;
+        printf("Headers incomplete\n");
+        return HTTP_PARSE_ERROR;
     }
 
     return total_read;
@@ -205,8 +223,8 @@ int read_http_body(int client_fd, char *buffer, size_t headers_end_pos,
     // Validate content length
     if (req->content_length > MAX_REQUEST_SIZE)
     {
-        printf("Content-Length too large: %zu bytes\n", req->content_length);
-        return -1;
+        printf("Content-Length too large: %zu bytes for %d\n", req->content_length, MAX_REQUEST_SIZE);
+        return HTTP_BODY_TOO_LARGE;
     }
 
     // Calculate how much body data we already have
@@ -229,17 +247,26 @@ int read_http_body(int client_fd, char *buffer, size_t headers_end_pos,
         if (to_read == 0)
         {
             printf("Request too large for buffer\n");
-            return -1;
+            return HTTP_BODY_TOO_LARGE;
         }
 
         ssize_t bytes = read_with_timeout(client_fd,
                                           buffer + headers_length + body_already_read,
                                           to_read);
 
-        if (bytes <= 0)
+        if (bytes == HTTP_IO_TIMEOUT)
         {
-            printf("Error reading request body\n");
-            return -1;
+            printf("Timeout mid-body\n");
+            return HTTP_IO_TIMEOUT_PARTIAL;
+        }
+        if (bytes == 0)
+        {
+            printf("EOF mid-body\n");
+            return HTTP_IO_EOF_PARTIAL;
+        }
+        if (bytes < 0)
+        {
+            return bytes;
         }
 
         body_already_read += bytes;
@@ -262,7 +289,7 @@ int parse_request_line(const char *line, http_request *req)
     if (sscanf(line, "%15s %2047s %15s", method, full_path, version) != 3)
     {
         printf("Failed to parse request line: '%s'\n", line);
-        return 0;
+        return HTTP_PARSE_ERROR;
     }
 
     size_t path_len = strlen(full_path);
@@ -275,7 +302,7 @@ int parse_request_line(const char *line, http_request *req)
         if (path_len >= MAX_PATH || strlen(query_start + 1) >= MAX_QUERY)
         {
             printf("Path or query too long\n");
-            return 0;
+            return HTTP_URI_TOO_LONG;
         }
         req->path[path_len] = '\0';
         strcpy(req->query, query_start + 1);
@@ -285,7 +312,7 @@ int parse_request_line(const char *line, http_request *req)
         if (path_len >= MAX_PATH)
         {
             printf("Path too long\n");
-            return 0;
+            return HTTP_URI_TOO_LONG;
         }
         req->query[0] = '\0';
     }
@@ -295,14 +322,14 @@ int parse_request_line(const char *line, http_request *req)
         strlen(version) >= MAX_VERSION)
     {
         printf("Request line components too long\n");
-        return 0;
+        return HTTP_PARSE_ERROR;
     }
 
     // Accept only known methods
     if (!is_method_allowed(method))
     {
         printf("Unsupported method: %s\n", method);
-        return 0;
+        return HTTP_METHOD_NOT_ALLOWED;
     }
 
     // Validate method characters (only uppercase letters)
@@ -311,7 +338,7 @@ int parse_request_line(const char *line, http_request *req)
         if (*p < 'A' || *p > 'Z')
         {
             printf("Invalid method: %s\n", method);
-            return 0;
+            return HTTP_PARSE_ERROR;
         }
     }
 
@@ -335,7 +362,7 @@ int parse_headers(const char *request_data, http_request *req)
 {
     const char *line_start = strstr(request_data, "\r\n");
     if (!line_start)
-        return 0;
+        return HTTP_PARSE_ERROR;
 
     line_start += 2; // Skip first \r\n
     req->header_count = 0;
@@ -353,7 +380,7 @@ int parse_headers(const char *request_data, http_request *req)
         if (line_len >= MAX_HEADER_LINE)
         {
             printf("Header line too long (%zu bytes)\n", line_len);
-            return 0;
+            return HTTP_HEADERS_TOO_LARGE;
         }
 
         // Validate header format (must contain :)
@@ -361,7 +388,7 @@ int parse_headers(const char *request_data, http_request *req)
         if (!colon)
         {
             printf("Invalid header format (no colon)\n");
-            return 0;
+            return HTTP_PARSE_ERROR;
         }
 
         // Copy header
@@ -517,7 +544,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
     FILE *file = fopen(filepath, "rb");
     if (!file)
     {
-        send_error_response(client_fd, 404, "Not Found", connection_header);
+        send_error_response(client_fd, 404, "Not Found", connection_header, method);
         return;
     }
 
@@ -529,7 +556,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
     if (file_size < 0)
     {
         fclose(file);
-        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header, method);
         return;
     }
 
@@ -550,7 +577,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
     {
         fclose(file);
         fprintf(stderr, "Error: Headers buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header, method);
         return;
     }
 
@@ -582,7 +609,7 @@ void send_file_response(int client_fd, const char *filepath, const char *method,
 }
 
 // Map URL path to file path
-void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
+int map_path_to_file(const char *url_path, char *file_path, size_t max_len)
 {
     if (strcmp(url_path, "/") == 0)
     {
@@ -590,13 +617,14 @@ void map_path_to_file(const char *url_path, char *file_path, size_t max_len)
     }
     else
     {
-        if (strlen("./www") + strlen(url_path) >= max_len)
+        int bytes = snprintf(file_path, max_len, "./www%s", url_path);
+        if (bytes < 0 || (size_t)bytes >= max_len)
         {
             fprintf(stderr, "File path too long\n");
-            return;
+            return HTTP_URI_TOO_LONG;
         }
-        snprintf(file_path, max_len, "./www%s", url_path);
     }
+    return 0;
 }
 
 void handle_post_request(int client_fd, const http_request *request, const char *connection_header)
@@ -605,14 +633,18 @@ void handle_post_request(int client_fd, const http_request *request, const char 
     if (request->body_length > 0 && strcmp(request->path, "/test") == 0)
     {
         char dir_path[1024];
-        map_path_to_file(request->path, dir_path, sizeof(dir_path));
+        if (map_path_to_file(request->path, dir_path, sizeof(dir_path)) != 0)
+        {
+            send_error_response(client_fd, 414, "URI Too Long", "close", request->method);
+            return;
+        }
         size_t dir_path_len = strlen(dir_path);
 
         struct stat st;
         if (stat(dir_path, &st) != 0 || !S_ISDIR(st.st_mode))
         {
             fprintf(stderr, "Directory %s does not exist or is not a directory\n", dir_path);
-            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header, request->method);
             return;
         }
 
@@ -658,7 +690,7 @@ void handle_post_request(int client_fd, const http_request *request, const char 
             if (dir_path_len > sizeof(log_path) - strlen("/image.") - ext_len - 1)
             {
                 fprintf(stderr, "Directory path too long for image log: %s\n", dir_path);
-                send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+                send_error_response(client_fd, 500, "Internal Server Error", request->connection_header, request->method);
                 return;
             }
             snprintf(log_path, sizeof(log_path), "%s/image.%s", dir_path, extension);
@@ -679,14 +711,14 @@ void handle_post_request(int client_fd, const http_request *request, const char 
         else
         {
             fprintf(stderr, "Unsupported Content-Type: %s\n", content_type ? content_type : "none");
-            send_error_response(client_fd, 415, "Unsupported Media Type", request->connection_header);
+            send_error_response(client_fd, 415, "Unsupported Media Type", request->connection_header, request->method);
             return;
         }
 
         if (!log)
         {
             fprintf(stderr, "Failed to open %s for writing: %s\n", log_path, strerror(errno));
-            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header);
+            send_error_response(client_fd, 500, "Internal Server Error", request->connection_header, request->method);
             return;
         }
 
@@ -731,7 +763,7 @@ void handle_post_request(int client_fd, const http_request *request, const char 
     if (offset >= sizeof(headers))
     {
         fprintf(stderr, "Error: Headers buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header, request->method);
         return;
     }
 
@@ -744,7 +776,7 @@ void handle_post_request(int client_fd, const http_request *request, const char 
     else
     {
         fprintf(stderr, "Error: Headers+body buffer too small\n");
-        send_error_response(client_fd, 500, "Internal Server Error", connection_header);
+        send_error_response(client_fd, 500, "Internal Server Error", connection_header, request->method);
         return;
     }
 
@@ -772,16 +804,13 @@ void handle_client(int client_fd)
     do
     {
         http_request request = {0};
-        strcpy(request.connection_header, "close"); // Default to close
+
+        int error_code = 0;
 
         // Step 1: Read complete headers
         int total_read = read_http_headers(client_fd, buffer, MAX_REQUEST_SIZE);
-        if (total_read <= 0)
+        if (!handle_read_headers_status(total_read, client_fd, request.method))
         {
-            if (total_read == 0)
-                printf("Client closed connection\n");
-            else
-                printf("Timeout or error reading headers\n");
             break;
         }
 
@@ -792,46 +821,34 @@ void handle_client(int client_fd)
         char *first_line_end = strstr(buffer, "\r\n");
 
         *first_line_end = '\0'; // Temporarily null-terminate first line
-        if (!parse_request_line(buffer, &request))
+        error_code = parse_request_line(buffer, &request);
+        if (!handle_request_line_status(error_code, client_fd, request.method))
         {
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-            free(buffer);
-            return;
+            break;
         }
         *first_line_end = '\r'; // Restore buffer
 
         printf("Request: %s %s %s\n", request.method, request.path, request.version);
 
-        // Step 4: Validate HTTP version
-        if (strcmp(request.version, "HTTP/1.1") != 0 && strcmp(request.version, "HTTP/1.0") != 0)
+        // Step 4: Parse headers
+        error_code = parse_headers(buffer, &request);
+        if (!handle_parse_headers_status(error_code, client_fd, request.method))
         {
-            send_error_response(client_fd, 505, "HTTP Version Not Supported", request.connection_header);
-            free(buffer);
-            return;
+            break;
         }
 
-        // Step 5: Parse headers
-        if (!parse_headers(buffer, &request))
+        // Step 5: Validate request
+        error_code = validate_http_request(&request);
+        if (!handle_validate_status(error_code, client_fd, request.method))
         {
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-            free(buffer);
-            return;
+            break;
         }
 
-        // Step 6: Validate request
-        if (!validate_http_request(&request))
+        // Step 6: Read body if present (for POST/PUT requests)
+        error_code = read_http_body(client_fd, buffer, (size_t)(header_end - buffer), (size_t)total_read, &request);
+        if (!handle_read_body_status(error_code, client_fd, request.connection_header, request.method))
         {
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-            free(buffer);
-            return;
-        }
-
-        // Step 7: Read body if present (for POST/PUT requests)
-        if (read_http_body(client_fd, buffer, header_end - buffer, total_read, &request) < 0)
-        {
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-            free(buffer);
-            return;
+            break;
         }
 
         if (request.body_length > 0)
@@ -846,19 +863,22 @@ void handle_client(int client_fd)
                    (request.body_length > 100) ? "..." : "");
         }
 
-        // Step 8: Validate path safety
+        // Step 7: Validate path safety
         if (!is_safe_path(request.path))
         {
-            send_error_response(client_fd, 400, "Bad Request", request.connection_header);
-            free(buffer);
-            return;
+            send_error_response(client_fd, 400, "Bad Request", request.connection_header, request.method);
+            break;
         }
 
-        // Step 9: Handle different methods
+        // Step 8: Handle different methods
         if (strcmp(request.method, "GET") == 0 || strcmp(request.method, "HEAD") == 0)
         {
             char file_path[1024];
-            map_path_to_file(request.path, file_path, sizeof(file_path));
+            if (map_path_to_file(request.path, file_path, sizeof(file_path)) != 0)
+            {
+                send_error_response(client_fd, 414, "URI Too Long", "close", request.method);
+                break;
+            }
             send_file_response(client_fd, file_path, request.method, request.connection_header);
         }
         else if (strcmp(request.method, "POST") == 0)
@@ -867,8 +887,9 @@ void handle_client(int client_fd)
         }
         else
         {
-            send_error_response(client_fd, 405, "Method Not Allowed", request.connection_header);
+            send_error_response_with_headers(client_fd, 405, "Method Not Allowed", request.connection_header, build_allow_header(), request.method);
         }
+
         printf("connection header: %s\n", request.connection_header);
         if (strn_case_cmp(request.connection_header, "keep-alive", 10) != 0)
         {
