@@ -7,6 +7,7 @@
 #include "error_handlers.h"
 #include "response_utils.h"
 #include "http_mappings.h"
+#include "string_utils.h"
 
 // Send error response
 void send_error_response(int client_fd, int status_code, const char *status_text, const char *connection_header, const char *method)
